@@ -8,10 +8,7 @@ import java.util.Random;
 
 public class SpeedTest  {
 
-  public static void testSpeed(
-    String indexPath,
-    Integer dimension,
-    Integer nQueries) throws IOException {
+  public static void testSpeed(String indexPath, int dimension, int nQueries) throws IOException {
 
     ANNIndex index = new ANNIndex(dimension, indexPath);
 
@@ -22,8 +19,7 @@ public class SpeedTest  {
     for(int i = 0; i < nQueries; i++) {
       int k = Math.abs(r.nextInt() % 1000000);
       // System.out.println("querying with item " + k);
-      float[] itemVector = index.getItemVector(k);
-      index.getNearest(itemVector, 10);
+      index.getNearest(k, x -> true, 10);
     }
     long tEnd = System.currentTimeMillis();
 

@@ -1,33 +1,16 @@
 package com.spotify.annoy;
 
 import java.io.Closeable;
-import java.util.List;
+import java.util.function.IntPredicate;
+import java.util.stream.Stream;
 
 /**
  * AnnoyIndex interface, provided to aid with dependency injection in tests.
  */
-public interface AnnoyIndex extends Closeable{
-  /**
-   * Get the vector for a given node's memory offset in the tree.
-   * @param nodeOffset  node index in the ANN tree
-   * @param v           output vector; overwritten.
-   * @deprecated this should not be a public method
-   */
-  @Deprecated
-  void getNodeVector(long nodeOffset, float[] v);
-
+public interface AnnoyIndex extends Closeable {
   /**
    * Get the vector for a given item in the tree.
-   * @param itemIndex  item id
-   * @param v          output vector; overwritten.
-   * @deprecated use getItemVector(itemIndex)'s return value
-   */
-  @Deprecated
-  void getItemVector(int itemIndex, float[] v);
-
-  /**
-   * Get the vector for a given item in the tree.
-   * @param itemIndex  item id
+   * @param itemIndex  item idx
    * @return item vector
    */
   float[] getItemVector(int itemIndex);
@@ -38,5 +21,15 @@ public interface AnnoyIndex extends Closeable{
    * @param nResults     number of items to return
    * @return             list of items in descending nearness to query point
    */
-  List<Integer> getNearest(float[] queryVector, int nResults);
+  Stream<IdxAndScore> getNearest(float[] queryVector, IntPredicate pred, int nResults);
+
+  /**
+   * Look up nearest neighbors in the tree.
+   * @param itemIndex    find nearest neighbors for this item
+   * @param nResults     number of items to return
+   * @return             list of items in descending nearness to query point
+   */
+  default Stream<IdxAndScore> getNearest(int itemIndex, IntPredicate pred, int nResults) {
+    return getNearest(getItemVector(itemIndex), pred, nResults);
+  }
 }

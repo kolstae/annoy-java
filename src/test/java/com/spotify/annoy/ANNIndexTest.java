@@ -1,9 +1,5 @@
 package com.spotify.annoy;
 
-import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.junit.runners.JUnit4;
-
 import java.io.BufferedReader;
 import java.io.FileReader;
 import java.io.IOException;
@@ -11,6 +7,11 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.stream.Collectors;
+
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.JUnit4;
 
 @RunWith(JUnit4.class)
 public class ANNIndexTest {
@@ -39,8 +40,8 @@ public class ANNIndexTest {
         expectedResults.add(Integer.parseInt(_i));
 
       // do the query
-      float[] itemVector = index.getItemVector(queryItemIndex);
-      List<Integer> retrievedResults = index.getNearest(itemVector, 10);
+      List<Integer> retrievedResults = index.getNearest(queryItemIndex, i -> true, 10)
+            .map(IdxAndScore::idx).collect(Collectors.toList());
 
       if (verbose) {
         System.out.println(String.format("query: %d", queryItemIndex));
@@ -61,32 +62,18 @@ public class ANNIndexTest {
   }
 
   @Test
-  /**
-   Make sure that the NNs retrieved by the Java version match the
-   ones pre-computed by the C++ version of the Angular index
-   using the default block size (for files up to 2GB).
-   */
   public void testAngular() throws IOException {
     testIndex(IndexType.ANGULAR, 0, false);
   }
 
 
   @Test
-  /**
-   Make sure that the NNs retrieved by the Java version match the
-   ones pre-computed by the C++ version of the Euclidean index
-   using the default block size (for files up to 2GB).
-   */
+
   public void testEuclidean() throws IOException {
     testIndex(IndexType.EUCLIDEAN, 0, false);
   }
 
   @Test
-  /**
-   Make sure that the NNs retrieved by the Java version match the
-   ones pre-computed by the C++ version of the Angular index
-   simulating files larger than 2GB.
-   */
   public void testAngularBlocks() throws IOException {
     testIndex(IndexType.ANGULAR, 10, false);
     testIndex(IndexType.ANGULAR, 1, false);
@@ -94,31 +81,13 @@ public class ANNIndexTest {
 
 
   @Test
-  /**
-   Make sure that the NNs retrieved by the Java version match the
-   ones pre-computed by the C++ version of the Euclidean index
-   simulating files larger than 2GB.
-   */
   public void testEuclideanMultipleBlocks() throws IOException {
     testIndex(IndexType.EUCLIDEAN, 10, false);
     testIndex(IndexType.EUCLIDEAN, 1, false);
   }
 
   @Test(expected = RuntimeException.class)
-  /**
-   Make sure wrong dimension size used to init ANNIndex will throw RuntimeException.
-   */
   public void testLoadFileWithWrongDimension() throws IOException {
-    ANNIndex index = new ANNIndex(7, "src/test/resources/points.euclidean.annoy");
-  }
-
-  @Test(expected = RuntimeException.class)
-  /**
-   Make sure wrong dimension size throw exception in getNearest()
-   */
-  public void testGetNearesWithWrongDim() throws IOException {
-    ANNIndex index = new ANNIndex(8, "src/test/resources/points.angular.annoy", IndexType.ANGULAR);
-    float[] u = {0f, 1.0f, 0.2f, 0.1f, 0f, 1.0f, 0.2f, 0.1f, 1f};
-    index.getNearest(u, 10);
+    new ANNIndex(7, "src/test/resources/points.euclidean.annoy");
   }
 }

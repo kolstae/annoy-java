@@ -2,34 +2,45 @@ package com.spotify.annoy;
 
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
-import java.util.*;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Optional;
+import java.util.PriorityQueue;
+import java.util.function.IntPredicate;
+import java.util.stream.Collectors;
+import java.util.stream.LongStream;
+import java.util.stream.Stream;
+
+import org.roaringbitmap.RoaringBitmap;
+import sun.misc.Cleaner;
 
 /**
  * Read-only Approximate Nearest Neighbor Index which queries
  * databases created by annoy.
  */
 public class ANNIndex implements AnnoyIndex {
+  private static final CosineDistance COSINE_DISTANCE = new CosineDistance();
+  private static final int INT_SIZE = 4;
+  private static final int FLOAT_SIZE = 4;
 
+  private final Collection<PQEntry> roots;
 
-  private final ArrayList<Long> roots;
-  private MappedByteBuffer[] buffers;
-
-  private final int DIMENSION, MIN_LEAF_SIZE;
-  private final IndexType INDEX_TYPE;
-  private final int INDEX_TYPE_OFFSET;
+  private final int dimension;
+  private final int minLeafSize;
+  private final int indexTypeOffset;
 
   // size of C structs in bytes (initialized in init)
-  private final int K_NODE_HEADER_STYLE;
-  private final long NODE_SIZE;
+  private final int headerSize;
+  private final long nodeSize;
 
-  private final int INT_SIZE = 4;
-  private final int FLOAT_SIZE = 4;
-  private final int MAX_NODES_IN_BUFFER;
-  private final int BLOCK_SIZE;
-  private RandomAccessFile memoryMappedFile;
+  private final int blockSize;
+  private final Distance distance;
+  private final RandomAccessFile memoryMappedFile;
+  private final ByteBuffer[] buffers;
+  private final int numNodes;
 
 
   /**
@@ -62,52 +73,59 @@ public class ANNIndex implements AnnoyIndex {
                   final String filename,
                   IndexType indexType,
                   final int blockSize) throws IOException {
-    DIMENSION = dimension;
-    INDEX_TYPE = indexType;
-    INDEX_TYPE_OFFSET = (INDEX_TYPE == IndexType.ANGULAR) ? 4 : 8;
-    K_NODE_HEADER_STYLE = (INDEX_TYPE == IndexType.ANGULAR) ? 12 : 16;
-    // we can store up to MIN_LEAF_SIZE children in leaf nodes (we put
+    this.dimension = dimension;
+    distance = indexType == IndexType.ANGULAR ? COSINE_DISTANCE : new EuclideanDistance();
+    indexTypeOffset = (indexType == IndexType.ANGULAR) ? 4 : 8;
+    headerSize = (indexType == IndexType.ANGULAR) ? 12 : 16;
+    // we can store up to minLeafSize children in leaf nodes (we put
     // them where the separating plane normally goes)
-    this.MIN_LEAF_SIZE = DIMENSION + 2;
-    this.NODE_SIZE = K_NODE_HEADER_STYLE + FLOAT_SIZE * DIMENSION;
-    this.MAX_NODES_IN_BUFFER = (int) (blockSize == 0 ?
-            Integer.MAX_VALUE / NODE_SIZE : blockSize * NODE_SIZE);
-    BLOCK_SIZE = (int) (this.MAX_NODES_IN_BUFFER * NODE_SIZE);
-    roots = new ArrayList<>();
-    load(filename);
+    this.minLeafSize = this.dimension + 2;
+    this.nodeSize = headerSize + FLOAT_SIZE * this.dimension;
+    final int maxNodesInBuffer = Math.toIntExact(blockSize == 0
+          ? Integer.MAX_VALUE / nodeSize
+          : blockSize * nodeSize);
+    this.blockSize = Math.toIntExact(maxNodesInBuffer * nodeSize);
+    final LoadedIndex loaded = load(filename, nodeSize, maxNodesInBuffer, this.blockSize);
+    buffers = loaded.buffers;
+    memoryMappedFile = loaded.file;
+    numNodes = loaded.numNodes;
+    roots = Arrays.stream(loaded.roots)
+          .mapToObj(r -> new PQEntry(1e30f, r))
+          .collect(Collectors.toList());
   }
 
-  private void load(final String filename) throws IOException {
-    memoryMappedFile = new RandomAccessFile(filename, "r");
-    long fileSize = memoryMappedFile.length();
+  private static LoadedIndex load(final String filename, long nodeSize, int maxNodesInBuffer, int blockSize) throws IOException {
+    final RandomAccessFile file = new RandomAccessFile(filename, "r");
+    final long fileSize = file.length();
     if (fileSize == 0L) {
       throw new IOException("Index is a 0-byte file?");
     }
 
-    int numNodes = (int) (fileSize / NODE_SIZE);
-    int buffIndex =  (numNodes - 1) / MAX_NODES_IN_BUFFER;
-    int rest = (int) (fileSize % BLOCK_SIZE);
-    int blockSize = (rest > 0 ? rest : BLOCK_SIZE);
+    int numNodes = Math.toIntExact(fileSize / nodeSize);
+    int buffIndex =  (numNodes - 1) / maxNodesInBuffer;
+    int rest = Math.toIntExact(fileSize % blockSize);
+    int lastBlockSize = (rest > 0 ? rest : blockSize);
     // Two valid relations between dimension and file size:
-    // 1) rest % NODE_SIZE == 0 makes sure either everything fits into buffer or rest is a multiple of NODE_SIZE;
-    // 2) (file_size - rest) % NODE_SIZE == 0 makes sure everything else is a multiple of NODE_SIZE.
-    if (rest % NODE_SIZE != 0 || (fileSize - rest) % NODE_SIZE != 0) {
+    // 1) rest % nodeSize == 0 makes sure either everything fits into buffer or rest is a multiple of nodeSize;
+    // 2) (file_size - rest) % nodeSize == 0 makes sure everything else is a multiple of nodeSize.
+    if (rest % nodeSize != 0 || (fileSize - rest) % nodeSize != 0) {
       throw new RuntimeException("ANNIndex initiated with wrong dimension size");
     }
-    long position = fileSize - blockSize;
-    buffers = new MappedByteBuffer[buffIndex + 1];
+    long position = fileSize - lastBlockSize;
+    final ByteBuffer[] buffers = new ByteBuffer[buffIndex + 1];
     boolean process = true;
     int m = -1;
     long index = fileSize;
+    final LongStream.Builder roots = LongStream.builder();
     while (position >= 0) {
-      MappedByteBuffer annBuf = memoryMappedFile.getChannel().map(
-              FileChannel.MapMode.READ_ONLY, position, blockSize);
-      annBuf.order(ByteOrder.LITTLE_ENDIAN);
+      final ByteBuffer annBuf = file.getChannel()
+            .map(FileChannel.MapMode.READ_ONLY, position, lastBlockSize)
+            .order(ByteOrder.LITTLE_ENDIAN);
 
       buffers[buffIndex--] = annBuf;
 
-      for (int i = blockSize - (int) NODE_SIZE; process && i >= 0; i -= NODE_SIZE) {
-        index -= NODE_SIZE;
+      for (int i = lastBlockSize - (int) nodeSize; process && i >= 0; i -= nodeSize) {
+        index -= nodeSize;
         int k = annBuf.getInt(i);  // node[i].n_descendants
         if (m == -1 || k == m) {
           roots.add(index);
@@ -116,75 +134,74 @@ public class ANNIndex implements AnnoyIndex {
           process = false;
         }
       }
-      blockSize = BLOCK_SIZE;
-      position -= blockSize;
+      lastBlockSize = blockSize;
+      position -= lastBlockSize;
     }
+    return new LoadedIndex(file, numNodes, buffers, roots.build().toArray());
   }
 
   private float getFloatInAnnBuf(long pos) {
-    int b = (int) (pos / BLOCK_SIZE);
-    int f = (int) (pos % BLOCK_SIZE);
+    int b = (int) (pos / blockSize);
+    int f = (int) (pos % blockSize);
     return buffers[b].getFloat(f);
   }
 
   private int getIntInAnnBuf(long pos) {
-    int b = (int) (pos / BLOCK_SIZE);
-    int i = (int) (pos % BLOCK_SIZE);
+    int b = (int) (pos / blockSize);
+    int i = (int) (pos % blockSize);
     return buffers[b].getInt(i);
   }
 
-  @Override
-  public void getNodeVector(final long nodeOffset, float[] v) {
-    MappedByteBuffer nodeBuf = buffers[(int) (nodeOffset / BLOCK_SIZE)];
-    int offset = (int) ((nodeOffset % BLOCK_SIZE) + K_NODE_HEADER_STYLE);
-    for (int i = 0; i < DIMENSION; i++) {
+  private void getNodeVector(final long nodeOffset, float[] v) {
+    final ByteBuffer nodeBuf = buffers[(int) (nodeOffset / blockSize)];
+    final int offset = (int) ((nodeOffset % blockSize) + headerSize);
+    for (int i = 0; i < dimension; i++) {
       v[i] = nodeBuf.getFloat(offset + i * FLOAT_SIZE);
     }
-  }
-
-  @Override
-  public void getItemVector(int itemIndex, float[] v) {
-    getNodeVector(itemIndex * NODE_SIZE, v);
   }
 
   private float getNodeBias(final long nodeOffset) { // euclidean-only
     return getFloatInAnnBuf(nodeOffset + 4);
   }
 
+  @Override
   public final float[] getItemVector(final int itemIndex) {
-    return getNodeVector(itemIndex * NODE_SIZE);
+    if (itemIndex < 0 || itemIndex >= numNodes) {
+      throw new IndexOutOfBoundsException(String.format("[0 - %d] was: %d", numNodes - 1, itemIndex));
+    }
+    return getNodeVector(itemIndex * nodeSize);
   }
 
-  public float[] getNodeVector(final long nodeOffset) {
-    float[] v = new float[DIMENSION];
+  private float[] getNodeVector(final long nodeOffset) {
+    float[] v = new float[dimension];
     getNodeVector(nodeOffset, v);
     return v;
   }
 
-  private static float norm(final float[] u) {
-    float n = 0;
-    for (float x : u)
-      n += x * x;
+  private static float euclideanDistance(final float[] u, final float[] v) {
+    double n = 0;
+    for (int i = 0; i < u.length; i++) {
+      final float d = u[i] - v[i];
+      n += d * d;
+    }
     return (float) Math.sqrt(n);
   }
 
-  private static float euclideanDistance(final float[] u, final float[] v) {
-    float[] diff = new float[u.length];
-    for (int i = 0; i < u.length; i++)
-      diff[i] = u[i] - v[i];
-    return norm(diff);
-  }
-
-  public static float cosineMargin(final float[] u, final float[] v) {
+  private static float cosineMargin(final float[] u, final float[] v) {
     double d = 0;
-    for (int i = 0; i < u.length; i++)
-      d += u[i] * v[i];
-    return (float) (d / (norm(u) * norm(v)));
+    double uu = 0;
+    double vv = 0;
+    for (int i = 0; i < u.length; i++) {
+      final float ui = u[i];
+      final float vi = v[i];
+      d += ui * vi;
+      uu += ui * ui;
+      vv += vi * vi;
+    }
+    return (float) (d / (Math.sqrt(uu) * Math.sqrt(vv)));
   }
 
-  public static float euclideanMargin(final float[] u,
-                                      final float[] v,
-                                      final float bias) {
+  private static float euclideanMargin(final float[] u, final float[] v, final float bias) {
     float d = bias;
     for (int i = 0; i < u.length; i++)
       d += u[i] * v[i];
@@ -206,100 +223,81 @@ public class ANNIndex implements AnnoyIndex {
    */
   @Override
   public void close() throws IOException {
+    Arrays.stream(buffers).forEach(ANNIndex::forceClose);
     memoryMappedFile.close();
   }
 
-  private class PQEntry implements Comparable<PQEntry> {
+  private static void forceClose(ByteBuffer b) {
+    try {
+      if (b instanceof sun.nio.ch.DirectBuffer) {
+        Optional.ofNullable(((sun.nio.ch.DirectBuffer) b).cleaner())
+              .ifPresent(Cleaner::clean);
+      }
+    } catch (Throwable e) {
+      e.printStackTrace();
+    }
+  }
+
+  static final class PQEntry implements Comparable<PQEntry> {
+    private final float margin;
+    private final long nodeOffset;
 
     PQEntry(final float margin, final long nodeOffset) {
       this.margin = margin;
       this.nodeOffset = nodeOffset;
     }
 
-    private float margin;
-    private long nodeOffset;
+    long getNodeOffset() {
+      return nodeOffset;
+    }
+
+    float getMargin() {
+      return margin;
+    }
 
     @Override
     public int compareTo(final PQEntry o) {
       return Float.compare(o.margin, margin);
     }
-
-  }
-
-  private static boolean isZeroVec(float[] v) {
-    for (int i = 0; i < v.length; i++)
-      if (v[i] != 0)
-        return false;
-    return true;
   }
 
   @Override
-  public final List<Integer> getNearest(final float[] queryVector,
-                                        final int nResults) {
+  public final Stream<IdxAndScore> getNearest(float[] queryVector, IntPredicate pred, int nResults) {
+    final PriorityQueue<PQEntry> pq = new PriorityQueue<>(roots.size() * FLOAT_SIZE);
+    pq.addAll(roots);
 
-    if (queryVector.length != DIMENSION) {
-      throw new RuntimeException(String.format("queryVector must be size of %d, but was %d",
-              DIMENSION, queryVector.length));
-    }
-
-    PriorityQueue<PQEntry> pq = new PriorityQueue<>(
-            roots.size() * FLOAT_SIZE);
-    final float kMaxPriority = 1e30f;
-
-    for (long r : roots) {
-      pq.add(new PQEntry(kMaxPriority, r));
-    }
-
-    Set<Integer> nearestNeighbors = new HashSet<Integer>();
-    while (nearestNeighbors.size() < roots.size() * nResults && !pq.isEmpty()) {
-      PQEntry top = pq.poll();
-      long topNodeOffset = top.nodeOffset;
-      int nDescendants = getIntInAnnBuf(topNodeOffset);
+    final int maxSize = roots.size() * nResults;
+    final RoaringBitmap bm = new RoaringBitmap();
+    final TopNBuilder builder = new TopNBuilder(nResults);
+    final IntPredicate p = pred.and(bm::checkedAdd);
+    int seen = 0;
+    while (seen < maxSize && !pq.isEmpty()) {
+      final long topNodeOffset = pq.poll().nodeOffset;
+      final int nDescendants = getIntInAnnBuf(topNodeOffset);
       float[] v = getNodeVector(topNodeOffset);
       if (nDescendants == 1) {  // n_descendants
-        // FIXME: does this ever happen?
-        if (isZeroVec(v))
-          continue;
-        nearestNeighbors.add((int) (topNodeOffset / NODE_SIZE));
-      } else if (nDescendants <= MIN_LEAF_SIZE) {
+        final int idx = (int) (topNodeOffset / nodeSize);
+        if (p.test(idx)) {
+          builder.add(idx, distance.distance(v, queryVector));
+          seen++;
+        }
+      } else if (nDescendants <= minLeafSize) {
         for (int i = 0; i < nDescendants; i++) {
-          int j = getIntInAnnBuf(topNodeOffset +
-                  INDEX_TYPE_OFFSET +
-                  i * INT_SIZE);
-          if (isZeroVec(getNodeVector(j * NODE_SIZE)))
-            continue;
-          nearestNeighbors.add(j);
+          final int idx = getIntInAnnBuf(topNodeOffset + indexTypeOffset + i * INT_SIZE);
+          if (p.test(idx)) {
+            builder.add(idx, distance.distance(getItemVector(idx), queryVector));
+            seen++;
+          }
         }
       } else {
-        float margin = (INDEX_TYPE == IndexType.ANGULAR) ?
-                cosineMargin(v, queryVector) :
-                euclideanMargin(v, queryVector, getNodeBias(topNodeOffset));
-        long childrenMemOffset = topNodeOffset + INDEX_TYPE_OFFSET;
-        long lChild = NODE_SIZE * getIntInAnnBuf(childrenMemOffset);
-        long rChild = NODE_SIZE * getIntInAnnBuf(childrenMemOffset + 4);
-        pq.add(new PQEntry(-margin, lChild));
-        pq.add(new PQEntry(margin, rChild));
+        float margin = distance.margin(v, queryVector, topNodeOffset);
+        long childrenMemOffset = topNodeOffset + indexTypeOffset;
+        pq.add(new PQEntry(-margin, nodeSize * getIntInAnnBuf(childrenMemOffset)));
+        pq.add(new PQEntry(margin, nodeSize * getIntInAnnBuf(childrenMemOffset + INT_SIZE)));
       }
     }
 
-    ArrayList<PQEntry> sortedNNs = new ArrayList<PQEntry>();
-    for (int nn : nearestNeighbors) {
-      float[] v = getItemVector(nn);
-      if (!isZeroVec(v)) {
-        sortedNNs.add(
-                new PQEntry((INDEX_TYPE == IndexType.ANGULAR) ?
-                        cosineMargin(v, queryVector) :
-                        -euclideanDistance(v, queryVector),
-                        nn));
-      }
-    }
-    Collections.sort(sortedNNs);
-
-    ArrayList<Integer> result = new ArrayList<>(nResults);
-    for (int i = 0; i < nResults && i < sortedNNs.size(); i++) {
-      result.add((int) sortedNNs.get(i).nodeOffset);
-    }
-    return result;
+    return builder.stream().map(e -> new IdxAndScore((int) e.nodeOffset, e.margin));
   }
 
 
@@ -314,10 +312,10 @@ public class ANNIndex implements AnnoyIndex {
 
     String indexPath = args[0];                 // 0
     int dimension = Integer.parseInt(args[1]);  // 1
-    IndexType indexType = null;                 // 2
-    if (args[2].toLowerCase().equals("angular"))
+    IndexType indexType;                        // 2
+    if ("angular".equalsIgnoreCase(args[2]))
       indexType = IndexType.ANGULAR;
-    else if (args[2].toLowerCase().equals("euclidean"))
+    else if ("euclidean".equalsIgnoreCase(args[2]))
       indexType = IndexType.EUCLIDEAN;
     else throw new RuntimeException("wrong index type specified");
     int queryItem = Integer.parseInt(args[3]);  // 3
@@ -332,14 +330,52 @@ public class ANNIndex implements AnnoyIndex {
     }
     System.out.printf("\n");
 
-    List<Integer> nearestNeighbors = annIndex.getNearest(u, 10);
-    for (int nn : nearestNeighbors) {
-      float[] v = annIndex.getItemVector(nn);
-      System.out.printf("%d %d %f\n",
-              queryItem, nn,
-              (indexType == IndexType.ANGULAR) ?
-                      cosineMargin(u, v) : euclideanDistance(u, v));
+    annIndex.getNearest(queryItem, i -> true, 10)
+          .mapToInt(IdxAndScore::idx)
+          .forEach(nn -> System.out.printf("%d %d %f\n", queryItem, nn, annIndex.distance.distance(u, annIndex.getItemVector(nn))));
+  }
+
+  private interface Distance {
+    float distance(float[] u, float[] v);
+
+    float margin(float[] u, float[] v, long nodeOffset);
+  }
+
+  private static final class CosineDistance implements Distance {
+    @Override
+    public float distance(float[] u, float[] v) {
+      return cosineMargin(u, v);
+    }
+
+    @Override
+    public float margin(float[] u, float[] v, long nodeOffset) {
+      return distance(u, v);
     }
   }
 
+  private final class EuclideanDistance implements Distance {
+    @Override
+    public float distance(float[] u, float[] v) {
+      return 1 - euclideanDistance(u, v);
+    }
+
+    @Override
+    public float margin(float[] u, float[] v, long nodeOffset) {
+      return euclideanMargin(u, v, getNodeBias(nodeOffset));
+    }
+  }
+
+  private static final class LoadedIndex {
+    private final RandomAccessFile file;
+    private final int numNodes;
+    private final ByteBuffer[] buffers;
+    private final long[] roots;
+
+    LoadedIndex(RandomAccessFile file, int numNodes, ByteBuffer[] buffers, long[] roots) {
+      this.file = file;
+      this.numNodes = numNodes;
+      this.buffers = buffers;
+      this.roots = roots;
+    }
+  }
 }
