@@ -277,16 +277,16 @@ public class ANNIndex implements AnnoyIndex {
         final int idx = (int) (topNodeOffset / nodeSize);
         if (p.test(idx)) {
           builder.add(idx, distance.distance(v, queryVector));
-          seen++;
         }
+        seen++;
       } else if (nDescendants <= minLeafSize) {
         for (int i = 0; i < nDescendants; i++) {
           final int idx = getIntInAnnBuf(topNodeOffset + indexTypeOffset + i * INT_SIZE);
           if (p.test(idx)) {
             builder.add(idx, distance.distance(getItemVector(idx), queryVector));
-            seen++;
           }
         }
+        seen += nDescendants;
       } else {
         float margin = distance.margin(v, queryVector, topNodeOffset);
         long childrenMemOffset = topNodeOffset + indexTypeOffset;
