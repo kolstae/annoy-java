@@ -38,7 +38,6 @@ public class ANNIndex implements AnnoyIndex {
 
   private final int blockSize;
   private final Distance distance;
-  private final RandomAccessFile memoryMappedFile;
   private final ByteBuffer[] buffers;
   private final int numNodes;
 
@@ -87,7 +86,6 @@ public class ANNIndex implements AnnoyIndex {
     this.blockSize = Math.toIntExact(maxNodesInBuffer * nodeSize);
     final LoadedIndex loaded = load(filename, nodeSize, maxNodesInBuffer, this.blockSize);
     buffers = loaded.buffers;
-    memoryMappedFile = loaded.file;
     numNodes = loaded.numNodes;
     roots = Arrays.stream(loaded.roots)
           .mapToObj(r -> new PQEntry(1e30f, r))
@@ -95,49 +93,52 @@ public class ANNIndex implements AnnoyIndex {
   }
 
   private static LoadedIndex load(final String filename, long nodeSize, int maxNodesInBuffer, int blockSize) throws IOException {
-    final RandomAccessFile file = new RandomAccessFile(filename, "r");
-    final long fileSize = file.length();
-    if (fileSize == 0L) {
-      throw new IOException("Index is a 0-byte file?");
-    }
-
-    int numNodes = Math.toIntExact(fileSize / nodeSize);
-    int buffIndex =  (numNodes - 1) / maxNodesInBuffer;
-    int rest = Math.toIntExact(fileSize % blockSize);
-    int lastBlockSize = (rest > 0 ? rest : blockSize);
-    // Two valid relations between dimension and file size:
-    // 1) rest % nodeSize == 0 makes sure either everything fits into buffer or rest is a multiple of nodeSize;
-    // 2) (file_size - rest) % nodeSize == 0 makes sure everything else is a multiple of nodeSize.
-    if (rest % nodeSize != 0 || (fileSize - rest) % nodeSize != 0) {
-      throw new RuntimeException("ANNIndex initiated with wrong dimension size");
-    }
-    long position = fileSize - lastBlockSize;
-    final ByteBuffer[] buffers = new ByteBuffer[buffIndex + 1];
-    boolean process = true;
-    int m = -1;
-    long index = fileSize;
-    final LongStream.Builder roots = LongStream.builder();
-    while (position >= 0) {
-      final ByteBuffer annBuf = file.getChannel()
-            .map(FileChannel.MapMode.READ_ONLY, position, lastBlockSize)
-            .order(ByteOrder.LITTLE_ENDIAN);
-
-      buffers[buffIndex--] = annBuf;
-
-      for (int i = lastBlockSize - (int) nodeSize; process && i >= 0; i -= nodeSize) {
-        index -= nodeSize;
-        int k = annBuf.getInt(i);  // node[i].n_descendants
-        if (m == -1 || k == m) {
-          roots.add(index);
-          m = k;
-        } else {
-          process = false;
+    try (final RandomAccessFile file = new RandomAccessFile(filename, "r")) {
+        final long fileSize = file.length();
+        if (fileSize == 0L) {
+            throw new IOException("Index is a 0-byte file?");
         }
-      }
-      lastBlockSize = blockSize;
-      position -= lastBlockSize;
+
+        final int numNodes = Math.toIntExact(fileSize / nodeSize);
+        int buffIndex = (numNodes - 1) / maxNodesInBuffer;
+        final int rest = Math.toIntExact(fileSize % blockSize);
+        int lastBlockSize = (rest > 0 ? rest : blockSize);
+        // Two valid relations between dimension and file size:
+        // 1) rest % nodeSize == 0 makes sure either everything fits into buffer or rest is a multiple of nodeSize;
+        // 2) (file_size - rest) % nodeSize == 0 makes sure everything else is a multiple of nodeSize.
+        if (rest % nodeSize != 0 || (fileSize - rest) % nodeSize != 0) {
+            throw new RuntimeException("ANNIndex initiated with wrong dimension size");
+        }
+        long position = fileSize - lastBlockSize;
+        final ByteBuffer[] buffers = new ByteBuffer[buffIndex + 1];
+        boolean process = true;
+        int m = -1;
+        long index = fileSize;
+        final LongStream.Builder roots = LongStream.builder();
+        try (final FileChannel fc = file.getChannel()) {
+          while (position >= 0) {
+            final ByteBuffer annBuf = fc
+                    .map(FileChannel.MapMode.READ_ONLY, position, lastBlockSize)
+                    .order(ByteOrder.LITTLE_ENDIAN);
+
+            buffers[buffIndex--] = annBuf;
+
+            for (int i = lastBlockSize - (int) nodeSize; process && i >= 0; i -= nodeSize) {
+              index -= nodeSize;
+              int k = annBuf.getInt(i);  // node[i].n_descendants
+              if (m == -1 || k == m) {
+                roots.add(index);
+                m = k;
+              } else {
+                process = false;
+              }
+            }
+            lastBlockSize = blockSize;
+            position -= lastBlockSize;
+            }
+        }
+        return new LoadedIndex(numNodes, buffers, roots.build().toArray());
     }
-    return new LoadedIndex(file, numNodes, buffers, roots.build().toArray());
   }
 
   private float getFloatInAnnBuf(long pos) {
@@ -218,13 +219,10 @@ public class ANNIndex implements AnnoyIndex {
    * to relinquish the underlying resources and to internally
    * <em>mark</em> the {@code Closeable} as closed, prior to throwing
    * the {@code IOException}.
-   *
-   * @throws IOException if an I/O error occurs
    */
   @Override
-  public void close() throws IOException {
+  public void close() {
     Arrays.stream(buffers).forEach(ANNIndex::forceClose);
-    memoryMappedFile.close();
   }
 
   private static void forceClose(ByteBuffer b) {
@@ -366,14 +364,12 @@ public class ANNIndex implements AnnoyIndex {
   }
 
   private static final class LoadedIndex {
-    private final RandomAccessFile file;
     private final int numNodes;
     private final ByteBuffer[] buffers;
     private final long[] roots;
 
-    LoadedIndex(RandomAccessFile file, int numNodes, ByteBuffer[] buffers, long[] roots) {
-      this.file = file;
-      this.numNodes = numNodes;
+    LoadedIndex(int numNodes, ByteBuffer[] buffers, long[] roots) {
+        this.numNodes = numNodes;
       this.buffers = buffers;
       this.roots = roots;
     }
