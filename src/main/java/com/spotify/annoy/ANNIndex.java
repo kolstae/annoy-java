@@ -267,29 +267,31 @@ public class ANNIndex implements AnnoyIndex {
     final int maxSize = roots.size() * nResults;
     final RoaringBitmap bm = new RoaringBitmap();
     final TopNBuilder builder = new TopNBuilder(nResults);
-    final IntPredicate p = pred.and(bm::checkedAdd);
     int seen = 0;
     while (seen < maxSize && !pq.isEmpty()) {
       final long topNodeOffset = pq.poll().nodeOffset;
       final int nDescendants = getIntInAnnBuf(topNodeOffset);
-      float[] v = getNodeVector(topNodeOffset);
       if (nDescendants == 1) {  // n_descendants
         final int idx = (int) (topNodeOffset / nodeSize);
-        if (p.test(idx)) {
-          builder.add(idx, distance.distance(v, queryVector));
+        if (bm.checkedAdd(idx)) {
+          if (pred.test(idx)) {
+            builder.add(idx, distance.distance(getNodeVector(topNodeOffset), queryVector));
+          }
+          seen++;
         }
-        seen++;
       } else if (nDescendants <= minLeafSize) {
         for (int i = 0; i < nDescendants; i++) {
           final int idx = getIntInAnnBuf(topNodeOffset + indexTypeOffset + i * INT_SIZE);
-          if (p.test(idx)) {
-            builder.add(idx, distance.distance(getItemVector(idx), queryVector));
+          if (bm.checkedAdd(idx)) {
+            if (pred.test(idx)) {
+              builder.add(idx, distance.distance(getItemVector(idx), queryVector));
+            }
+            seen++;
           }
         }
-        seen += nDescendants;
       } else {
-        float margin = distance.margin(v, queryVector, topNodeOffset);
-        long childrenMemOffset = topNodeOffset + indexTypeOffset;
+        final float margin = distance.margin(getNodeVector(topNodeOffset), queryVector, topNodeOffset);
+        final long childrenMemOffset = topNodeOffset + indexTypeOffset;
         pq.add(new PQEntry(-margin, nodeSize * getIntInAnnBuf(childrenMemOffset)));
         pq.add(new PQEntry(margin, nodeSize * getIntInAnnBuf(childrenMemOffset + INT_SIZE)));
       }

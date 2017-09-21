@@ -4,7 +4,7 @@
 
   <groupId>com.spotify</groupId>
   <artifactId>annoy</artifactId>
-  <version>0.3.1-finn</version>
+  <version>0.3.2-finn</version>
   <packaging>jar</packaging>
 
   <name>annoy</name>
