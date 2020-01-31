@@ -2,20 +2,21 @@ package com.spotify.annoy;
 
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Optional;
 import java.util.PriorityQueue;
+import java.util.function.Consumer;
 import java.util.function.IntPredicate;
 import java.util.stream.Collectors;
 import java.util.stream.LongStream;
 import java.util.stream.Stream;
 
 import org.roaringbitmap.RoaringBitmap;
-import sun.misc.Cleaner;
+import sun.misc.Unsafe;
 
 /**
  * Read-only Approximate Nearest Neighbor Index which queries
@@ -222,14 +223,30 @@ public class ANNIndex implements AnnoyIndex {
    */
   @Override
   public void close() {
-    Arrays.stream(buffers).forEach(ANNIndex::forceClose);
+    for (int i = 0; i < buffers.length; i++) {
+      final ByteBuffer buffer = buffers[i];
+      buffers[i] = ByteBuffer.allocate(0);
+      forceClose(buffer);
+    }
+  }
+
+  private static final Consumer<ByteBuffer> cleaner;
+
+  static {
+    try {
+      final Field f = Unsafe.class.getDeclaredField("theUnsafe");
+      f.setAccessible(true);
+      final Unsafe unsafe = (Unsafe) f.get(null);
+      cleaner = unsafe::invokeCleaner;
+    } catch (NoSuchFieldException | IllegalAccessException e) {
+      throw new ExceptionInInitializerError(e);
+    }
   }
 
   private static void forceClose(ByteBuffer b) {
     try {
-      if (b instanceof sun.nio.ch.DirectBuffer) {
-        Optional.ofNullable(((sun.nio.ch.DirectBuffer) b).cleaner())
-              .ifPresent(Cleaner::clean);
+      if (b.isDirect()) {
+          cleaner.accept(b);
       }
     } catch (Throwable e) {
       e.printStackTrace();
