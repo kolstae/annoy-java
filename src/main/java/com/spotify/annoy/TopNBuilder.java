@@ -24,11 +24,12 @@ final class TopNBuilder {
     }
 
     void add(int id, float score) {
-        if (count == 0) {
+        if (Float.isFinite(score)) {
+          if (count == 0) {
             items[0] = new PQEntry(score, id);
             count = 1;
             minScore = score;
-        } else if (score > minScore || isNotFull()) {
+          } else if (score > minScore || isNotFull()) {
             count = Math.min(items.length, count + 1);
             final PQEntry item = new PQEntry(score, id);
             final int ip = Arrays.binarySearch(items, 0, count - 1, item);
@@ -37,6 +38,7 @@ final class TopNBuilder {
             System.arraycopy(items, idx, items, idx + 1, count - idx - 1);
             items[idx] = item;
             minScore = items[count - 1].getMargin();
+          }
         }
     }
 
