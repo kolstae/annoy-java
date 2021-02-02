@@ -7,7 +7,7 @@ import java.util.stream.Stream;
 import com.spotify.annoy.ANNIndex.PQEntry;
 
 final class TopNBuilder {
-    private PQEntry[] items;
+    private final PQEntry[] items;
     private int count = 0;
     private double minScore = Double.NEGATIVE_INFINITY;
 
