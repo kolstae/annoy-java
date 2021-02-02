@@ -181,24 +181,24 @@ public class ANNIndex implements AnnoyIndex {
   }
 
   private static float euclideanDistance(final float[] u, final float[] v) {
-    double n = 0;
+    float n = 0;
     for (int i = 0; i < u.length; i++) {
       final float d = u[i] - v[i];
-      n += d * d;
+      n = Math.fma(d, d, n);
     }
     return (float) Math.sqrt(n);
   }
 
   private static float cosineMargin(final float[] u, final float[] v) {
-    double d = 0;
-    double uu = 0;
-    double vv = 0;
+    float d = 0;
+    float uu = 0;
+    float vv = 0;
     for (int i = 0; i < u.length; i++) {
       final float ui = u[i];
       final float vi = v[i];
-      d += ui * vi;
-      uu += ui * ui;
-      vv += vi * vi;
+      d = Math.fma(ui, vi, d);
+      uu = Math.fma(ui, ui, uu);
+      vv = Math.fma(vi, vi, vv);
     }
     return (float) (d / (Math.sqrt(uu) * Math.sqrt(vv)));
   }
@@ -206,7 +206,7 @@ public class ANNIndex implements AnnoyIndex {
   private static float euclideanMargin(final float[] u, final float[] v, final float bias) {
     float d = bias;
     for (int i = 0; i < u.length; i++)
-      d += u[i] * v[i];
+      d = Math.fma(u[i], v[i], d);
     return d;
   }
 
